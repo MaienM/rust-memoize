@@ -1,5 +1,7 @@
 #![crate_type = "proc-macro"]
 #![allow(unused_imports)] // Spurious complaints about a required trait import.
+use std::collections::HashMap;
+
 use syn::{self, parse, parse_macro_input, spanned::Spanned, Expr, ExprCall, ItemFn, Path};
 
 use proc_macro::TokenStream;
@@ -12,7 +14,9 @@ mod kw {
     syn::custom_keyword!(CustomHasher);
     syn::custom_keyword!(HasherInit);
     syn::custom_keyword!(Ignore);
+    syn::custom_keyword!(Map);
     syn::custom_punctuation!(Colon, :);
+    syn::custom_punctuation!(Arrow, ->);
 }
 
 #[derive(Default, Clone)]
@@ -23,6 +27,7 @@ struct CacheOptions {
     custom_hasher: Option<Path>,
     custom_hasher_initializer: Option<ExprCall>,
     ignore: Vec<syn::Ident>,
+    map: HashMap<syn::Ident, syn::Type>,
 }
 
 #[derive(Clone)]
@@ -33,6 +38,7 @@ enum CacheOption {
     CustomHasher(Path),
     HasherInit(ExprCall),
     Ignore(syn::Ident),
+    Map((syn::Ident, syn::Type)),
 }
 
 // To extend option parsing, add functionality here.
@@ -86,6 +92,14 @@ impl parse::Parse for CacheOption {
             let ignore_ident = input.parse::<syn::Ident>().unwrap();
             return Ok(CacheOption::Ignore(ignore_ident));
         }
+        if la.peek(kw::Map) {
+            input.parse::<kw::Map>().unwrap();
+            input.parse::<kw::Colon>().unwrap();
+            let ident = input.parse::<syn::Ident>().unwrap();
+            input.parse::<kw::Arrow>().unwrap();
+            let typ = input.parse::<syn::Type>().unwrap();
+            return Ok(CacheOption::Map((ident, typ)));
+        }
         Err(la.error())
     }
 }
@@ -104,6 +118,9 @@ impl parse::Parse for CacheOptions {
                 CacheOption::HasherInit(init) => opts.custom_hasher_initializer = Some(init),
                 CacheOption::SharedCache => opts.shared_cache = true,
                 CacheOption::Ignore(ident) => opts.ignore.push(ident),
+                CacheOption::Map((ident, typ)) => {
+                    opts.map.insert(ident, typ);
+                }
             }
         }
         Ok(opts)
@@ -247,8 +264,12 @@ mod store {
  *
  * Parameters can be ignored by the cache using the `Ignore` parameter. `Ignore` can be specified
  * multiple times, once per each parameter. `Ignore`d parameters do not need to implement [`Clone`]
- * or [`Hash`]. 
- * 
+ * or [`Hash`].
+ *
+ * Parameters can be mapped to another type for the cache using the `Map` parameter. `Map` can be
+ * specified multiple times, once per each parameter. `Map`ped parameters need to implement [`Into`]
+ * for the type they are mapped to.
+ *
  * See the `examples` for concrete applications.
  *
  * *The following descriptions need the `full` feature enabled.*
@@ -291,24 +312,34 @@ pub fn memoize(attr: TokenStream, item: TokenStream) -> TokenStream {
         Err(e) => return e.to_compile_error().into(),
     };
 
-    // Input types and names that are actually stored in the cache.
+    // Input types and expressions that are actually stored in the cache.
     let memoized_input_types: Vec<Box<syn::Type>> = input_params
         .iter()
+        .filter_map(|p| match &p.mode {
+            MemoizeMode::Regular => Some(p.arg_type.clone()),
+            MemoizeMode::Mapped(typ) => Some(Box::new(typ.clone())),
+            MemoizeMode::Ignored => None,
+        })
+        .collect();
+    let memoized_input_exprs: Vec<_> = input_params
+        .iter()
         .filter_map(|p| {
-            if p.is_memoized {
-                Some(p.arg_type.clone())
-            } else {
-                None
+            let ident = p.arg_name.clone();
+            match &p.mode {
+                MemoizeMode::Regular => Some(quote::quote! { #ident }),
+                MemoizeMode::Mapped(typ) => Some(quote::quote! { #typ::from(#ident) }),
+                MemoizeMode::Ignored => None,
             }
         })
         .collect();
-    let memoized_input_names: Vec<syn::Ident> = input_params
+    let memoized_input_exprs_cloned: Vec<_> = input_params
         .iter()
         .filter_map(|p| {
-            if p.is_memoized {
-                Some(p.arg_name.clone())
-            } else {
-                None
+            let ident = p.arg_name.clone();
+            match &p.mode {
+                MemoizeMode::Regular => Some(quote::quote! { #ident.clone() }),
+                MemoizeMode::Mapped(typ) => Some(quote::quote! { #typ::from(#ident) }),
+                MemoizeMode::Ignored => None,
             }
         })
         .collect();
@@ -319,10 +350,9 @@ pub fn memoize(attr: TokenStream, item: TokenStream) -> TokenStream {
         .iter()
         .map(|p| {
             let ident = p.arg_name.clone();
-            if p.is_memoized {
-                quote::quote! { #ident.clone() }
-            } else {
-                quote::quote! { #ident }
+            match p.mode {
+                MemoizeMode::Regular => quote::quote! { #ident.clone() },
+                MemoizeMode::Mapped(_) | MemoizeMode::Ignored => quote::quote! { #ident },
             }
         })
         .collect();
@@ -359,8 +389,8 @@ pub fn memoize(attr: TokenStream, item: TokenStream) -> TokenStream {
     let memoized_id = &renamed_fn.sig.ident;
 
     // Construct memoizer function, which calls the original function.
-    let syntax_names_tuple = quote::quote! { (#(#memoized_input_names),*) };
-    let syntax_names_tuple_cloned = quote::quote! { (#(#memoized_input_names.clone()),*) };
+    let syntax_names_tuple = quote::quote! { (#(#memoized_input_exprs),*) };
+    let syntax_names_tuple_cloned = quote::quote! { (#(#memoized_input_exprs_cloned),*) };
     let forwarding_tuple = quote::quote! { (#(#fn_forwarded_exprs),*) };
     let (insert_fn, get_fn) = store::cache_access_methods(&options);
     let (read_memo, memoize) = match options.time_to_live {
@@ -443,6 +473,12 @@ pub fn memoize(attr: TokenStream, item: TokenStream) -> TokenStream {
     .into()
 }
 
+enum MemoizeMode {
+    Regular,
+    Ignored,
+    Mapped(syn::Type),
+}
+
 /// An argument of the memoized function.
 struct FnArgument {
     /// Type of the argument.
@@ -451,8 +487,8 @@ struct FnArgument {
     /// Identifier (name) of the argument.
     arg_name: syn::Ident,
 
-    /// Whether or not this specific argument is included in the memoization.
-    is_memoized: bool,
+    /// The memoization mode for this specific argument.
+    mode: MemoizeMode,
 }
 
 fn check_signature(
@@ -471,11 +507,17 @@ fn check_signature(
 
             if let syn::Pat::Ident(patident) = &*arg.pat {
                 let arg_name = patident.ident.clone();
-                let is_memoized = !options.ignore.contains(&arg_name);
+                let mode = if options.ignore.contains(&arg_name) {
+                    MemoizeMode::Ignored
+                } else if let Some(typ) = options.map.get(&arg_name) {
+                    MemoizeMode::Mapped(typ.clone())
+                } else {
+                    MemoizeMode::Regular
+                };
                 params.push(FnArgument {
                     arg_type,
                     arg_name,
-                    is_memoized,
+                    mode,
                 });
             } else {
                 return Err(syn::Error::new(
